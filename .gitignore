@@ -1,3 +1,9 @@
+# 下載 SIDA 模型
+# 1. pip install huggingface_hub
+# 2. huggingface-cli download saberzl/SIDA-13B \
+#   --local-dir ./ck/SIDA-13B \
+#   --local-dir-use-symlinks False
+
 /ck/sam_vit_h_4b8939.pth
 /ck/SIDA-7B
 /ck/SIDA-13B
