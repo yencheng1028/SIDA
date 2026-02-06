@@ -6,9 +6,8 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, CLIPImageProcessor
+from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor
 
-# 移除 BitsAndBytesConfig，因為我們改用純 FP16
 from model.SIDA import SIDAForCausalLM
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
@@ -21,10 +20,10 @@ def parse_args(args):
     parser = argparse.ArgumentParser(description="SIDA chat")
     parser.add_argument("--version", default="SIDA-7B-v1")
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
-    # 預設改為 fp16
+    # 預設改為 fp16，因為 1080Ti 對 bf16 支援度不佳
     parser.add_argument(
         "--precision",
-        default="fp16",
+        default="fp16", 
         type=str,
         choices=["fp32", "bf16", "fp16"],
         help="precision for inference",
@@ -36,7 +35,6 @@ def parse_args(args):
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
     )
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
-    # 這些參數保留但預設不啟用
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
@@ -56,9 +54,7 @@ def preprocess(
     img_size=1024,
 ) -> torch.Tensor:
     """Normalize pixel values and pad to a square input."""
-    # Normalize colors
     x = (x - pixel_mean) / pixel_std
-    # Pad
     h, w = x.shape[-2:]
     padh = img_size - h
     padw = img_size - w
@@ -70,7 +66,7 @@ def main(args):
     args = parse_args(args)
     os.makedirs(args.vis_save_path, exist_ok=True)
 
-    # 1. Tokenizer
+    # Create model
     tokenizer = AutoTokenizer.from_pretrained(
         args.version,
         cache_dir=None,
@@ -82,23 +78,45 @@ def main(args):
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
     args.cls_token_idx = tokenizer("[CLS]", add_special_tokens=False).input_ids[0]
 
-    # 2. 設定 Dtype (強烈建議 1080Ti 使用 fp16)
-    torch_dtype = torch.float16
+    # 設定運算精度
+    torch_dtype = torch.float32
     if args.precision == "bf16":
-        # Pascal 架構不支援 bf16，會報錯或變慢，這裡強制轉回 fp16 或 fp32
-        print("Warning: GTX 10-series does not support bfloat16. Switching to float16.")
+        torch_dtype = torch.bfloat16
+    elif args.precision == "fp16":
         torch_dtype = torch.float16
-    elif args.precision == "fp32":
-        torch_dtype = torch.float32
 
-    # 3. Model Loading (關鍵修改：device_map="auto")
-    print(f"Loading model with {torch_dtype} across available GPUs...")
-    
+    # 【修改重點 1】: 加入 device_map="auto"
+    # 這會讓 Accelerate 自動偵測你的兩張顯卡並分配模型
     kwargs = {
         "torch_dtype": torch_dtype,
-        "device_map": "auto",  # <--- 讓 HuggingFace 自動分配模型到兩張卡
+        "device_map": "auto", 
     }
 
+    # 如果還是想用量化（雙卡通常不需要，但保留邏輯），這裡邏輯不變
+    if args.load_in_4bit:
+        kwargs.update(
+            {
+                "load_in_4bit": True,
+                "quantization_config": BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    llm_int8_skip_modules=["visual_model"],
+                ),
+            }
+        )
+    elif args.load_in_8bit:
+        kwargs.update(
+            {
+                "quantization_config": BitsAndBytesConfig(
+                    llm_int8_skip_modules=["visual_model"],
+                    load_in_8bit=True,
+                ),
+            }
+        )
+
+    print(f"Loading model with kwargs: {kwargs}")
     model = SIDAForCausalLM.from_pretrained(
         args.version, 
         low_cpu_mem_usage=True, 
@@ -112,37 +130,39 @@ def main(args):
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    # 注意：使用了 device_map="auto" 後，不要再呼叫 model.cuda()，否則會破壞分配
-    
+    # 【修改重點 2】: 移除 model.cuda()
+    # 因為 device_map="auto" 已經把模型放好了，手動移動會破壞分配導致 OOM。
+    # 這裡只需要做視覺模組初始化
     try:
         model.get_model().initialize_vision_modules(model.get_model().config)
         vision_tower = model.get_model().get_vision_tower()
-        # 確保 Vision Tower 也在正確的 dtype，device 交給 accelerate 管理
+        
+        # 視覺模組如果沒有被自動分配，這裡稍微保護一下，確保它使用正確精度
+        # 但不要強制 .cuda()，讓 accelerate 控制
         vision_tower.to(dtype=torch_dtype) 
+        
+        # 如果視覺模組還在 CPU，可以考慮將它放到主 GPU，但通常 initialize 會處理好
+        if vision_tower.device.type == 'cpu':
+             vision_tower.to(device='cuda')
+             
     except AttributeError:
-        print("Vision tower initialization skipped.")
+        print("Vision tower initialization skipped as SIDA-7B-v1 may not have this module.")
+
+    # 【修改重點 3】: 移除模型轉型代碼
+    # 之前這裡有 model.float().cuda() 等等，現在全部刪除。
+    # 因為 from_pretrained 已經用 torch_dtype 載入正確格式了。
 
     clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(args.image_size)
 
     model.eval()
-    
-    # 打印模型分配情況，確認是否有用到兩張卡
-    print("\nModel device map:")
-    if hasattr(model, "hf_device_map"):
-        print(model.hf_device_map)
-    else:
-        print(f"Model is on: {model.device}")
+    print(f"Model loaded successfully across devices. Main device: {model.device}")
 
     while True:
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
 
-        try:
-            prompt = input("Please input your prompt: ")
-        except EOFError:
-            break
-            
+        prompt = input("Please input your prompt: ")
         prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
         if args.use_mm_start_end:
             replace_token = (
@@ -163,39 +183,52 @@ def main(args):
         image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
         original_size_list = [image_np.shape[:2]]
 
-        # 處理 Image Clip
+        # 輸入的數據仍然需要送到 GPU (通常是 GPU 0)
+        # device_map 模型通常能處理跨設備輸入，但手動送入 cuda:0 是最保險的
         image_clip = (
             clip_image_processor.preprocess(image_np, return_tensors="pt")[
                 "pixel_values"
             ][0]
             .unsqueeze(0)
-            .to(device="cuda", dtype=torch_dtype) # 統一轉為 fp16 且放上 GPU
+            .cuda() 
         )
+        
+        # 確保輸入精度與模型一致
+        if args.precision == "bf16":
+            image_clip = image_clip.bfloat16()
+        elif args.precision == "fp16":
+            image_clip = image_clip.half()
+        else:
+            image_clip = image_clip.float()
 
         image = transform.apply_image(image_np)
         resize_list = [image.shape[:2]]
 
-        # 處理 Image
         image = (
             preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
             .unsqueeze(0)
-            .to(device="cuda", dtype=torch_dtype) # 統一轉為 fp16 且放上 GPU
+            .cuda()
         )
+        
+        if args.precision == "bf16":
+            image = image.bfloat16()
+        elif args.precision == "fp16":
+            image = image.half()
+        else:
+            image = image.float()
 
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-        input_ids = input_ids.unsqueeze(0).cuda() # Input ID 通常在第一張卡處理即可
+        input_ids = input_ids.unsqueeze(0).cuda()
 
-        with torch.no_grad():
-            output_ids, pred_masks = model.evaluate(
-                image_clip,
-                image,
-                input_ids,
-                resize_list,
-                original_size_list,
-                max_new_tokens=512,
-                tokenizer=tokenizer,
-            )
-        
+        output_ids, pred_masks = model.evaluate(
+            image_clip,
+            image,
+            input_ids,
+            resize_list,
+            original_size_list,
+            max_new_tokens=512,
+            tokenizer=tokenizer,
+        )
         output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
 
         text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
