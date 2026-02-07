@@ -14,4 +14,4 @@ bf16 (Brain Float 16): 由 Google 開發。同樣是 16 bits，但它犧牲了�
 
 原本需要 20GB 顯存的模型，經過 4-bit 量化後可能只需要 5GB 就能跑動。
 
-3. precision 和 量化 只能2選1指定
+3. Inference指令: CUDA_VISIBLE_DEVICES=0,1 python chat_dual_gpu.py --version='./ck/SIDA-7B' --precision fp16
