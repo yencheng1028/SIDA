@@ -6,6 +6,9 @@ print(f"CUDA 是否可用: {torch.cuda.is_available()}")
 device_count = torch.cuda.device_count()
 print(f"偵測到的 GPU 數量: {device_count}")
 
+print(f"torch version: {torch.__version__}")
+print(f"torch.version.cuda: {torch.version.cuda}")
+
 # 列出每張顯卡的名稱與細節
 for i in range(device_count):
     props = torch.cuda.get_device_properties(i)
@@ -51,7 +54,7 @@ for i in range(device_count):
 
 
 
-# # 4.在另一個終端機動態監控，使用指令watch -n 1 nvidia-smi觀察
+# # 4.在另一個終端機動態監控，使用指令watch -n 1 nvidia-smi觀察，或是nvidia-smi -l 1 或是 nvidia-smi --loop=1，
 # # Processes是否出現 python 程序，
 # # GPU-Util運算時使用率是否會衝高，
 # # Memory-Usage: 顯存是否有被佔用，
