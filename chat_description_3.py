@@ -1,3 +1,4 @@
+
 import argparse
 import os
 import sys
@@ -8,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor
 
-from model.SIDA_description_Parallelism import SIDAForCausalLM
+from model.SIDA_description_3 import SIDAForCausalLM
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
@@ -106,12 +107,11 @@ def main(args):
     elif args.precision == "fp16":
         torch_dtype = torch.half
 
-    # 修改 1: 加入 device_map="auto" 啟用雙卡分配
-    kwargs = {"torch_dtype": torch_dtype, "device_map": "auto"}
-    
+    kwargs = {"torch_dtype": torch_dtype}
     if args.load_in_4bit:
         kwargs.update(
             {
+                "torch_dtype": torch.half,
                 "load_in_4bit": True,
                 "quantization_config": BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -125,36 +125,47 @@ def main(args):
     elif args.load_in_8bit:
         kwargs.update(
             {
+                "torch_dtype": torch.half,
                 "quantization_config": BitsAndBytesConfig(
                     llm_int8_skip_modules=["visual_model"],
                     load_in_8bit=True,
                 ),
             }
         )
-
+    # 設定 device_map="auto"，讓 Accelerate 自動分配模型到雙卡
     model = SIDAForCausalLM.from_pretrained(
-        args.version, low_cpu_mem_usage=True, vision_tower=args.vision_tower, seg_token_idx=args.seg_token_idx, cls_token_idx=args.cls_token_idx, **kwargs
+        args.version, low_cpu_mem_usage=True, vision_tower=args.vision_tower, seg_token_idx=args.seg_token_idx, cls_token_idx=args.cls_token_idx, device_map="auto", **kwargs
     )
 
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    # 修改 2: 移除強制的 model.cuda() 以及模型精度轉換的 cuda 呼叫
+    # 已刪除了強制指定的 model.cuda()
+
     try:
         model.get_model().initialize_vision_modules(model.get_model().config)
         vision_tower = model.get_model().get_vision_tower()
         vision_tower.to(dtype=torch_dtype)
-        # 確保視覺塔不在 CPU
-        if vision_tower.device.type == 'cpu':
-             vision_tower.to(model.device)
+        # 確保 vision_tower 不在 CPU
+        # if vision_tower.device.type == 'cpu':
+        #     vision_tower.to(model.device)
     except AttributeError:
         print("Vision tower initialization skipped as SIDA-7B-v1 may not have this module.")
+
+    # 已移除了精度轉換時附帶的 .cuda() 呼叫
+    if args.precision == "bf16":
+        model = model.bfloat16()
+    elif args.precision == "fp16":
+        model = model.half()
+    else:
+        model = model.float()
 
     clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(args.image_size)
 
     model.eval()
+
 
     while True:
         conv = conversation_lib.conv_templates[args.conv_type].copy()
@@ -181,13 +192,13 @@ def main(args):
         image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
         original_size_list = [image_np.shape[:2]]
 
-        # 修改 3: 輸入的張量都使用 model.device 動態匹配，不寫死 cuda()
+        # 將輸入張量送到對應的 model.device 而非固定的 .cuda()
         image_clip = (
             clip_image_processor.preprocess(image_np, return_tensors="pt")[
                 "pixel_values"
             ][0]
             .unsqueeze(0)
-            .to(model.device)
+            .to(model.device)  # 對應設備
         )
         if args.precision == "bf16":
             image_clip = image_clip.bfloat16()
@@ -202,7 +213,7 @@ def main(args):
         image = (
             preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
             .unsqueeze(0)
-            .to(model.device)
+            .to(model.device)  # 對應設備
         )
         if args.precision == "bf16":
             image = image.bfloat16()
@@ -212,7 +223,7 @@ def main(args):
             image = image.float()
 
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-        input_ids = input_ids.unsqueeze(0).to(model.device)
+        input_ids = input_ids.unsqueeze(0).to(model.device)  # 對應設備
 
         output_ids, pred_masks = model.evaluate(
             image_clip,
